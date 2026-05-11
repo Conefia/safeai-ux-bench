@@ -1,0 +1,140 @@
+agent_id: "A1"
+tier: "A1"
+name: "Grounded Educational Agent"
+
+description: >
+  A1 adds Retrieval-Augmented Generation (RAG) to the A0 baseline. On every turn,
+  the agent can call search_knowledge to retrieve relevant chunks from the clinician-
+  approved knowledge base before composing its response. It must cite every factual
+  claim inline using the source URLs returned by the retrieval tool. This tier isolates
+  the contribution of grounded, source-backed responses versus the ungrounded baseline.
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+model:
+  provider: "Azure OpenAI"
+  deployment: "gpt-5-chat"
+  temperature: 0.0        # overridden to 0.0 for evaluation; production default is 0.7
+  max_tokens: 800
+  seed: 42
+
+# ---------------------------------------------------------------------------
+# Runtime
+# ---------------------------------------------------------------------------
+runtime:
+  framework: "LangChain v1 create_agent"
+  # ZienaAgent is instantiated with tier=A1_RAG.
+  # LangChain's create_agent() binds base_tools to the model and runs a
+  # standard ReAct-style agent loop. The agent decides on its own when to
+  # call search_knowledge before composing its reply.
+  invoke_path: "ZienaAgent.process_message() → create_agent(model, base_tools, system_prompt)"
+  tool_list_used: "base_tools"
+  # base_tools contains every tool present in self._tool_registry that matches
+  # the base_tools filter: [KNOWLEDGE_SEARCH, SYMPTOM_LOG, CYCLE_LOG,
+  # MEMORY_RETRIEVE, MEMORY_SAVE, TIME_ELAPSED]. For A1 only KNOWLEDGE_SEARCH
+  # and TIME_ELAPSED are registered (the others require capabilities not in A1).
+
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+system_prompt:
+  source: "LOAD_FROM_DB"
+  # Loaded via build_system_prompt() called inside ZienaAgent.process_message().
+  # Pulls PromptVersion.base_prompt from the database for the active version.
+  mode: "standard_only"
+  # A1 has no profiling capability. is_profiling_mode is always False.
+  # <profile block> sections are stripped from the assembled prompt.
+  sections:
+    - base_prompt: "Agent identity, role, and behavioral tone"
+    - context_prompt: "Dynamic context header (username, session status, prior memory)"
+    - tool_prompt: "Tool usage instructions (search_knowledge, citation rules)"
+    - variety_prompt: "Style and formatting rules (response length, tone mirroring)"
+
+# ---------------------------------------------------------------------------
+# Features
+# ---------------------------------------------------------------------------
+features:
+  rag: true
+  memory: false
+  guardrails: false
+  profiling: false
+  tool_use: true
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+tools:
+  search_knowledge:
+    enum: "Tool.KNOWLEDGE_SEARCH"
+    description: >
+      Queries Azure Cognitive Search with a natural-language query. Generates a
+      vector embedding of the query, performs k-nearest-neighbour search (k=2)
+      over the text_vector field, and filters results to score > 0.7. Returns
+      up to 2 content chunks, each with topic, chunk text, and source URL.
+      The agent MUST call this before writing any medical or factual claim.
+    backend: "RAGService.semantic_search()"
+    index: "Azure Cognitive Search — RAG_INDEX_NAME (from .env)"
+    retrieval_method: "vector search (k=2, score_threshold=0.7)"
+    embedding_model: "Azure OpenAI text-embedding via EmbeddingService"
+    returns: "Formatted string of up to 2 chunks: **topic**\\nchunk\\n\\n*Source: url*"
+
+  time_since_date:
+    enum: "Tool.TIME_ELAPSED"
+    description: >
+      Calculates the elapsed time between two dates (or from a date to today).
+      Used for age calculation, months since last period, symptom duration, etc.
+      Returns years, months, weeks, days, total_days, total_months, and a
+      plain-English human_summary.
+    backend: "TemporalTool.calculate_time_elapsed()"
+    args:
+      from_date: "YYYY-MM-DD (required)"
+      to_date: "YYYY-MM-DD (optional, defaults to today)"
+      label: "context string e.g. 'age' (optional)"
+
+# ---------------------------------------------------------------------------
+# Guardrails
+# ---------------------------------------------------------------------------
+guardrails:
+  enabled: false
+  # OrchestratorV2 is NOT used for A1. No input or output filtering.
+
+# ---------------------------------------------------------------------------
+# Memory
+# ---------------------------------------------------------------------------
+memory:
+  enabled: false
+
+# ---------------------------------------------------------------------------
+# RAG
+# ---------------------------------------------------------------------------
+rag:
+  enabled: true
+  service: "RAGService (services/rag_service.py)"
+  search_endpoint: "SEARCH_ENDPOINT env var (Azure Cognitive Search)"
+  index_name: "RAG_INDEX_NAME env var"
+  api_version: "2025-09-01"
+  k: 2
+  score_threshold: 0.7
+  vector_field: "text_vector"
+  selected_fields: ["chunk", "summary", "topic", "url"]
+  deduplication: "chunk-level — already-retrieved chunks are tracked per session and skipped"
+  citation_requirement: >
+    Every factual or clinical claim in the response MUST be cited inline immediately
+    after the statement using markdown format: [Source](URL). Citations at the end
+    only are not acceptable. This is enforced by the tool_prompt instructions.
+
+# ---------------------------------------------------------------------------
+# Profiling
+# ---------------------------------------------------------------------------
+profiling:
+  enabled: false
+  prompt_mode: "standard_only"
+
+# ---------------------------------------------------------------------------
+# Evaluation routing (run_agent.py)
+# ---------------------------------------------------------------------------
+evaluation_routing:
+  dispatcher: "_ask_ziena"
+  tier_map_key: "A1"
+  agent_class: "ZienaAgent(tier=AgentTier.A1_RAG)"

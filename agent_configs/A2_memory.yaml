@@ -1,0 +1,128 @@
+agent_id: "A2"
+tier: "A2"
+name: "Safety-Governed Agent"
+
+description: >
+  A2 replaces RAG with a safety control layer. The agent has no retrieval capability
+  and no tools — its only differentiating capability is that every user input and
+  every agent output passes through OrchestratorV2's guardrail pipeline before
+  being delivered. This tier isolates the contribution of dynamic input/output
+  safety filtering versus both the ungrounded baseline (A0) and the grounded agent (A1).
+  The guardrail rules are DB-driven and loaded at runtime via a thread-safe cache (60s TTL).
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+model:
+  provider: "Azure OpenAI"
+  deployment: "gpt-5-chat"
+  temperature: 0.0
+  max_tokens: 800
+  seed: 42
+
+# ---------------------------------------------------------------------------
+# Runtime
+# ---------------------------------------------------------------------------
+runtime:
+  framework: "LangChain v1 (no tools) + OrchestratorV2 guardrail wrapper"
+  # INTENDED design:
+  #   OrchestratorV2.process() runs input guardrails → ZienaAgent(A2) → output guardrails.
+  #   ZienaAgent(A2) has no tools, so it falls through to direct model.ainvoke(),
+  #   identical to A0 at the LLM level — the only difference is the guardrail wrapping.
+  #
+  # CURRENT evaluation routing (run_agent.py):
+  #   A2 is dispatched to _ask_ziena(), NOT _ask_orchestrator(). This means
+  #   OrchestratorV2 is NOT called and guardrails do NOT run during evaluation.
+  #   ⚠ This is a routing bug — A2 evaluations are currently equivalent to A0.
+  #   Fix: add "A2" to the _ask_orchestrator branch in run_agent.py._ask_agent().
+  invoke_path: >
+    INTENDED: OrchestratorV2.process() → AdvancedContentGuard (input) →
+              ZienaAgent.process_message() → model.ainvoke() →
+              AdvancedContentGuard (output)
+    ACTUAL (eval):  ZienaAgent(A2_GUARDRAILS).process_message() → model.ainvoke()
+                    (OrchestratorV2 bypassed — guardrails do not run)
+
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+system_prompt:
+  source: "LOAD_FROM_DB"
+  mode: "standard_only"
+  sections:
+    - base_prompt: "Agent identity, role, and behavioral tone"
+    - context_prompt: "Dynamic context header"
+    - tool_prompt: "Tool usage instructions (no tools registered — section present but irrelevant)"
+    - variety_prompt: "Style and formatting rules"
+
+# ---------------------------------------------------------------------------
+# Features
+# ---------------------------------------------------------------------------
+features:
+  rag: false
+  memory: false
+  guardrails: true    # active only when routed through OrchestratorV2
+  profiling: false
+  tool_use: false
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+tools: []
+# No tools are registered for A2. The Feature.GUARDRAILS capability has no
+# associated tool — guardrails operate as a wrapper around the LLM call, not
+# as callable functions exposed to the model.
+
+# ---------------------------------------------------------------------------
+# Guardrails
+# ---------------------------------------------------------------------------
+guardrails:
+  enabled: true
+  implementation: "OrchestratorV2 → AdvancedContentGuard"
+  config_source: "DB-driven GuardrailRule model, loaded via get_active_guardrail_config()"
+  cache_ttl_seconds: 60
+  fail_open: "configurable per DB record (fail_open flag)"
+  input_guardrails:
+    description: >
+      User input is screened by AdvancedContentGuard._run_guardrails() before
+      reaching the LLM. If a red-flag condition is detected, a pre-configured
+      refusal or escalation response is returned immediately and the LLM is not called.
+    triggers: "DB-driven rules (IssueType enum from advanced_content_guard.py)"
+    output_on_block: "Pre-configured refusal message from the matching GuardrailRule"
+  output_guardrails:
+    description: >
+      Agent response is screened by _run_output_guardrails() after the LLM call.
+      Also includes URL checking. If the response is flagged, it is replaced or
+      suppressed before delivery to the user.
+
+# ---------------------------------------------------------------------------
+# Memory
+# ---------------------------------------------------------------------------
+memory:
+  enabled: false
+
+# ---------------------------------------------------------------------------
+# RAG
+# ---------------------------------------------------------------------------
+rag:
+  enabled: false
+
+# ---------------------------------------------------------------------------
+# Profiling
+# ---------------------------------------------------------------------------
+profiling:
+  enabled: false
+  prompt_mode: "standard_only"
+
+# ---------------------------------------------------------------------------
+# Evaluation routing (run_agent.py)
+# ---------------------------------------------------------------------------
+evaluation_routing:
+  dispatcher: "_ask_ziena"   # ← ROUTING BUG: should be _ask_orchestrator
+  tier_map_key: "A2"
+  agent_class: "ZienaAgent(tier=AgentTier.A2_GUARDRAILS)"
+  known_issue: >
+    A2 is currently routed to _ask_ziena() in run_agent.py, which instantiates
+    ZienaAgent directly without OrchestratorV2. Guardrails therefore do not run
+    during evaluation. To fix, move "A2" from the _ask_ziena branch to the
+    _ask_orchestrator branch AND pass the tier to OrchestratorV2 so it creates
+    a ZienaAgent(A2) instead of defaulting to A4.

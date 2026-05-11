@@ -1,0 +1,218 @@
+agent_id: "A3"
+tier: "A3"
+name: "Context-Aware Personalized Agent"
+
+description: >
+  A3 adds persistent memory and progressive profiling to the baseline. The agent
+  maintains cross-session memory of important user details and drives a structured
+  health intake questionnaire (progressive profiling) to build a longitudinal user
+  health profile. It has no RAG and no safety guardrails. This tier isolates the
+  contribution of personalization and contextual memory versus the safety-governed
+  tier (A2). A3 is read-only with respect to the knowledge base — it can read user
+  profile and symptom data but does not update it in the intended design.
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+model:
+  provider: "Azure OpenAI"
+  deployment: "gpt-5-chat"
+  temperature: 0.0
+  max_tokens: 800
+  seed: 42
+
+# ---------------------------------------------------------------------------
+# Runtime
+# ---------------------------------------------------------------------------
+runtime:
+  framework: "LangChain v1 create_agent (standard) + custom _run_profiling_turn (profiling)"
+  # A3 runs in two distinct modes depending on the is_profiling_mode flag:
+  #
+  # Standard mode (is_profiling_mode=False):
+  #   create_agent(model, base_tools, system_prompt) → standard ReAct loop.
+  #   base_tools for A3: [retrieve_past_conversations, remember_detail, time_since_date]
+  #
+  # Profiling mode (is_profiling_mode=True):
+  #   _run_profiling_turn() — a custom 3-step loop that bypasses create_agent:
+  #     Step 1: model.bind_tools(profiling_tools).ainvoke() — model decides whether
+  #             to call a tool (e.g. save_profiling_answer) based on user's reply.
+  #     Step 2: Tool is executed and a ToolMessage is appended to the message list.
+  #     Step 3: model.ainvoke() WITHOUT tools — forces a plain text response.
+  #   profiling_tools for A3: [time_since_date]
+  #   (save_profiling_answer and stop_health_profiling are not in A3's tool set)
+  #
+  # CURRENT evaluation routing (run_agent.py):
+  #   A3 is dispatched to _ask_orchestrator(), which instantiates OrchestratorV2.
+  #   OrchestratorV2 always calls create_sophie_agent() with NO tier argument,
+  #   defaulting to AgentTier.A4_FULL. A3 evaluations therefore run as A4.
+  #   ⚠ This is a routing bug — A3 evaluations are currently equivalent to A4.
+  #   Fix: pass tier=AgentTier.A3_PROFILING to create_sophie_agent() inside
+  #        OrchestratorV2, and disable guardrails for A3 runs.
+
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+system_prompt:
+  source: "LOAD_FROM_DB"
+  mode: "dual — standard and profiling"
+  # A3 is the first tier where two distinct prompts are active.
+  # build_system_prompt(is_profiling_mode=True/False) selects between them.
+  standard_prompt:
+    source_field: "PromptVersion.base_prompt"
+    fallback: "DEFAULT_BASE_IDENTITY (hardcoded in ziena_prompt.py)"
+    description: "Used for all conversational turns when profiling is complete or skipped."
+    sections:
+      - base_prompt: "Agent identity and behavioral tone"
+      - context_prompt: "Session metadata, user status, prior memory summary"
+      - tool_prompt: >
+          Tool usage instructions. The <profile block> section (profiling tool rules)
+          is STRIPPED from the prompt in standard mode via regex substitution.
+      - variety_prompt: "Style and formatting rules"
+  profiling_prompt:
+    source_field: "PromptVersion.profiling_prompt"
+    fallback: "_get_fallback_profiling_prompt() (hardcoded in ziena_prompt.py)"
+    description: >
+      Used when the user has missing health profile data and has not opted out.
+      The <<PROFILING NEXT QUESTION>> tag in the prompt is dynamically replaced
+      by MenopauseProfilingTool.get_next_profiling_context(user.id) at build time,
+      injecting the exact question to ask and the expected answer options.
+    sections:
+      - profiling_prompt: "Profiling mode identity, directives, and constraints"
+      - context_prompt: "Session metadata"
+      - tool_prompt: >
+          Tool usage instructions with <profile block> content REVEALED
+          (the profiling tool rules section is included, not stripped).
+      - variety_prompt: "Style and formatting rules"
+  profile_block_handling: >
+    The <profile block>...</profile block> tags in tool_prompt wrap the profiling
+    tool instructions. In standard mode, the block and its contents are removed.
+    In profiling mode, only the tags are removed and the content is preserved.
+
+# ---------------------------------------------------------------------------
+# Features
+# ---------------------------------------------------------------------------
+features:
+  rag: false
+  memory: true
+  guardrails: false    # no guardrails in the intended A3 design
+  profiling: true
+  tool_use: true
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+tools:
+  retrieve_past_conversations:
+    enum: "Tool.MEMORY_RETRIEVE"
+    mode: "standard"
+    description: >
+      Retrieves the user's past conversation memory from PostgreSQL. Also
+      automatically includes the 5 most recent symptom logs and 3 most recent
+      cycle records pulled directly from the database. Used at the start of
+      returning-user sessions to re-establish context.
+    backend: "MemoryTool → PostgresMemoryService"
+    args:
+      user_id: "string (required)"
+      query_context: "string (optional) — topic hint for memory filtering"
+
+  remember_detail:
+    enum: "Tool.MEMORY_SAVE"
+    mode: "standard"
+    description: >
+      Saves a single qualitative fact about the user to persistent memory
+      (e.g., "prefers morning workouts", "allergic to peanuts"). Not used
+      for routine health tracking data — only for important one-off details
+      that should be recalled in future sessions.
+    backend: "MemoryTool → PostgresMemoryService"
+    args:
+      session_id: "string (required)"
+      key: "string (required) — descriptive label"
+      value: "string (required) — the detail to remember"
+
+  time_since_date:
+    enum: "Tool.TIME_ELAPSED"
+    mode: "standard and profiling"
+    description: >
+      Calculates elapsed time between two dates. Available in both standard
+      and profiling modes. Used for age, months since last period, symptom duration.
+    backend: "TemporalTool.calculate_time_elapsed()"
+    args:
+      from_date: "YYYY-MM-DD (required)"
+      to_date: "YYYY-MM-DD (optional, defaults to today)"
+      label: "context string (optional)"
+
+  note_profiling_tools: >
+    save_profiling_answer and stop_health_profiling are NOT in A3's tool set.
+    Tool.PROFILING_SAVE and Tool.PROFILING_STOP are absent from _TIER_TOOLS[A3].
+    In the current implementation, A3's profiling_tools list therefore contains
+    only time_since_date. This means profiling mode in A3 cannot persist answers
+    to the database. This is a gap between the intended design and the implementation.
+
+  note_symptom_tools: >
+    GET_ACTIVE_SYMPTOMS and GET_SYMPTOM_HISTORY have been merged into a single
+    tool: GET_SYMPTOM_DATA ("get_symptom_data"). Both tiers (A3, A4) always
+    required both together; splitting them served no purpose.
+
+# ---------------------------------------------------------------------------
+# Guardrails
+# ---------------------------------------------------------------------------
+guardrails:
+  enabled: false
+  # A3 intentionally has no guardrails. OrchestratorV2 must not apply content
+  # filtering when running A3 — it should be configured to route A3 without
+  # the guardrail wrapping.
+
+# ---------------------------------------------------------------------------
+# Memory
+# ---------------------------------------------------------------------------
+memory:
+  enabled: true
+  backend: "PostgresMemoryService (services/postgres_memory_service.py)"
+  storage: "PostgreSQL — chat_metadata.agent_remembered (JSONB column)"
+  scope: "cross-session — details persist and are recalled in future sessions"
+  retrieve_tool: "retrieve_past_conversations"
+  save_tool: "remember_detail"
+
+# ---------------------------------------------------------------------------
+# RAG
+# ---------------------------------------------------------------------------
+rag:
+  enabled: false
+
+# ---------------------------------------------------------------------------
+# Profiling
+# ---------------------------------------------------------------------------
+profiling:
+  enabled: true
+  implementation: "MenopauseProfilingTool (agents_v2/tools/profiling_tool.py)"
+  trigger: >
+    The is_profiling_mode flag is set by OrchestratorV2 before calling
+    ZienaAgent.process_message(). It is True when the user has incomplete health
+    profile data and has not previously opted out of profiling.
+  fields_collected:
+    - periods_stopped: "Has the user's period stopped?"
+    - pattern: "Menstrual pattern (regular/irregular)"
+    - symptoms: "Current symptoms"
+    - hormones: "Hormone therapy status"
+    - surgery: "Surgical history (hysterectomy / oophorectomy)"
+    - age: "User's date of birth"
+    - tiebreaker: "Additional disambiguating question if stage is uncertain"
+  stage_inference: >
+    MenopauseProfilingTool computes a predicted menopause stage (pre, peri, post, surgical)
+    from the collected field values. A3 collects these data points but does NOT have
+    write-back tools to persist the stage to the database (write-back is A4 only).
+  prompt_mode: "dual — standard and profiling"
+
+# ---------------------------------------------------------------------------
+# Evaluation routing (run_agent.py)
+# ---------------------------------------------------------------------------
+evaluation_routing:
+  dispatcher: "_ask_orchestrator"
+  agent_class: "ZienaAgent (default tier = A4_FULL)"  # ← ROUTING BUG
+  known_issue: >
+    OrchestratorV2 calls create_sophie_agent() with no tier argument, defaulting
+    to AgentTier.A4_FULL. A3 evaluations therefore run the full A4 system
+    (with RAG, guardrails, write-back tools) instead of A3.
+    Fix: OrchestratorV2 must accept a tier parameter and pass it to
+    create_sophie_agent(). The evaluation runner must pass tier="A3" to
+    OrchestratorV2, and the guardrail step must be skipped for A3 runs.

@@ -1,0 +1,100 @@
+agent_id: "A0"
+tier: "A0"
+name: "Ungoverned Baseline"
+
+description: >
+  A0 is the ungoverned baseline agent. It is a direct call to the language model
+  with only a static system prompt — no tools, no retrieval, no guardrails, no memory,
+  and no profiling. It serves as the lower-bound reference for all ablation comparisons.
+  All capability gains measured across A1–A4 are relative to this baseline.
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+model:
+  provider: "Azure OpenAI"
+  deployment: "gpt-5-chat"
+  temperature: 0.0        # fixed for reproducibility across all evaluation runs
+  max_tokens: 800
+  seed: 42                # passed via model_kwargs to Azure OpenAI for determinism
+
+# ---------------------------------------------------------------------------
+# Runtime
+# ---------------------------------------------------------------------------
+runtime:
+  framework: "none"
+  # A0 bypasses LangChain's create_agent entirely. A single SystemMessage + HumanMessage
+  # pair is sent directly to model.ainvoke(). There is no agent loop, no tool binding,
+  # and no intermediate reasoning steps.
+  invoke_path: "AzureChatOpenAI.ainvoke([SystemMessage, HumanMessage])"
+
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+system_prompt:
+  source: "LOAD_FROM_DB"
+  # Loads the active PromptVersion.base_prompt from the database.
+  # Falls back to the hardcoded DEFAULT_BASE_IDENTITY string in ziena_prompt.py
+  # if no active version is found.
+  mode: "standard_only"
+  # A0 has no profiling capability, so only the standard (base) prompt is ever used.
+  # The build_system_prompt() function is NOT called for A0 during evaluation —
+  # the system prompt is loaded statically from the YAML via agent_config.load_config().
+  sections:
+    - base_prompt: "Agent identity, role, and behavioral tone"
+
+# ---------------------------------------------------------------------------
+# Features
+# ---------------------------------------------------------------------------
+features:
+  rag: false
+  memory: false
+  guardrails: false
+  profiling: false
+  tool_use: false
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+tools: []
+# No tools are registered or bound. The model cannot call any external functions.
+
+# ---------------------------------------------------------------------------
+# Guardrails
+# ---------------------------------------------------------------------------
+guardrails:
+  enabled: false
+  # OrchestratorV2 is NOT used for A0. There is no input or output filtering.
+  # Harmful, unsafe, or off-topic content is not intercepted.
+
+# ---------------------------------------------------------------------------
+# Memory
+# ---------------------------------------------------------------------------
+memory:
+  enabled: false
+  # No conversation history beyond the current session is retrieved or stored.
+  # Each question is answered from scratch with no prior context.
+
+# ---------------------------------------------------------------------------
+# RAG
+# ---------------------------------------------------------------------------
+rag:
+  enabled: false
+  # No knowledge retrieval. All responses are generated from the model's
+  # parametric knowledge only. No citations are possible.
+
+# ---------------------------------------------------------------------------
+# Profiling
+# ---------------------------------------------------------------------------
+profiling:
+  enabled: false
+  prompt_mode: "standard_only"
+
+# ---------------------------------------------------------------------------
+# Evaluation routing (run_agent.py)
+# ---------------------------------------------------------------------------
+evaluation_routing:
+  dispatcher: "_ask_raw"
+  # A0 is the only tier that uses _ask_raw(). All other tiers go through
+  # _ask_ziena() or _ask_orchestrator(). This is enforced by the condition:
+  #   if tier not in {"A1", "A2", "A3", "A4"}: use _ask_raw

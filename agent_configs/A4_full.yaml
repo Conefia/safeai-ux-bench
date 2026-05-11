@@ -1,0 +1,248 @@
+agent_id: "A4"
+tier: "A4"
+name: "Full Ziena Agentic Companion"
+
+description: >
+  A4 is the complete production system. It combines all capabilities: RAG-grounded
+  responses with inline citations, dynamic input/output safety guardrails, persistent
+  cross-session memory, progr                                                               essive health profiling, and predictive menopause stage
+  inference. It is the only tier with two distinct prompt modes (standard and profiling)
+  and the only tier that can write back to the user's health profile database.
+  All ablation improvements accumulate at A4.
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+model:
+  provider: "Azure OpenAI"
+  deployment: "gpt-5-chat"
+  temperature: 0.0        # evaluation setting; production default is 0.7
+  max_tokens: 800
+  seed: 42
+
+# ---------------------------------------------------------------------------
+# Runtime
+# ---------------------------------------------------------------------------
+runtime:
+  framework: "OrchestratorV2 (guardrail wrapper) + LangChain v1 create_agent (standard) + custom _run_profiling_turn (profiling)"
+  #
+  # Every A4 request passes through OrchestratorV2.process():
+  #   1. Input guardrails (AdvancedContentGuard) — blocks/sanitizes harmful input
+  #   2. ZienaAgent.process_message() — routes to standard or profiling sub-loop
+  #   3. Output guardrails (AdvancedContentGuard) — screens the response
+  #
+  # Standard mode (is_profiling_mode=False):
+  #   create_agent(model, base_tools, system_prompt) → ReAct agent loop
+  #   base_tools: [search_knowledge, retrieve_past_conversations, remember_detail,
+  #                log_user_symptom, log_user_cycle, time_since_date]
+  #   NOTE: log_user_symptom and log_user_cycle require Tool.SYMPTOM_LOG and
+  #   Tool.CYCLE_LOG in the tier tool set, which are currently absent from
+  #   _TIER_TOOLS[A4]. These tools are therefore not registered and not available.
+  #
+  # Profiling mode (is_profiling_mode=True):
+  #   _run_profiling_turn() — custom 3-step loop:
+  #     Step 1: model.bind_tools(profiling_tools).ainvoke() — model calls a tool if needed
+  #     Step 2: Execute the tool, append ToolMessage to message chain
+  #     Step 3: model.ainvoke() WITHOUT tools — forces plain text response
+  #   profiling_tools: [search_knowledge, time_since_date]
+  #   NOTE: save_profiling_answer and stop_health_profiling require Tool.PROFILING_SAVE
+  #   and Tool.PROFILING_STOP, which are absent from _TIER_TOOLS[A4]. They are
+  #   therefore not registered as @tool wrappers and are NOT available in profiling mode.
+  #   This means A4 cannot persist profiling answers during evaluation runs.
+
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+system_prompt:
+  source: "LOAD_FROM_DB"
+  mode: "dual — standard and profiling"
+  standard_prompt:
+    source_field: "PromptVersion.base_prompt"
+    fallback: "DEFAULT_BASE_IDENTITY (hardcoded in ziena_prompt.py)"
+    description: "Used for all standard conversational turns."
+    sections:
+      - base_prompt: "Agent identity, role, and behavioral tone"
+      - context_prompt: "Session metadata, user status, prior memory summary"
+      - tool_prompt: >
+          Full tool usage instructions. The <profile block> content is STRIPPED
+          in standard mode (profiling tool rules are hidden from the model).
+      - variety_prompt: "Style and formatting rules"
+  profiling_prompt:
+    source_field: "PromptVersion.profiling_prompt"
+    fallback: "_get_fallback_profiling_prompt() (hardcoded in ziena_prompt.py)"
+    description: >
+      Used when the user has an incomplete health profile and has not opted out.
+      The <<PROFILING NEXT QUESTION>> placeholder is replaced at build time by
+      MenopauseProfilingTool.get_next_profiling_context(user.id), which injects
+      the exact question text, expected answer options, and the field_name to
+      pass to save_profiling_answer.
+    sections:
+      - profiling_prompt: "Profiling mode directive and constraints"
+      - context_prompt: "Session metadata"
+      - tool_prompt: >
+          Tool usage instructions with <profile block> content INCLUDED
+          (profiling tool rules are visible to the model).
+      - variety_prompt: "Style and formatting rules"
+  profile_block_handling: >
+    <profile block>...</profile block> in the tool_prompt wraps profiling
+    instructions. Standard mode: block + content stripped. Profiling mode:
+    tags stripped, content preserved.
+
+# ---------------------------------------------------------------------------
+# Features
+# ---------------------------------------------------------------------------
+features:
+  rag: true
+  memory: true
+  guardrails: true
+  profiling: true
+  tool_use: true
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+tools:
+  search_knowledge:
+    enum: "Tool.KNOWLEDGE_SEARCH"
+    mode: "standard and profiling"
+    description: >
+      Queries Azure Cognitive Search with a natural-language query. Generates a
+      vector embedding, performs k=2 nearest-neighbour search over text_vector,
+      filters to score > 0.7, deduplicates by chunk content within the session,
+      and returns up to 2 formatted chunks with topic, content, and source URL.
+      Mandatory before any factual or clinical claim.
+    backend: "KnowledgeTool → RAGService.semantic_search()"
+    retrieval_method: "vector search (k=2, score_threshold=0.7)"
+    returns: "Formatted string: **topic**\\nchunk\\n\\n*Source: url*"
+
+  retrieve_past_conversations:
+    enum: "Tool.MEMORY_RETRIEVE"
+    mode: "standard"
+    description: >
+      Retrieves persistent memory for the user across past sessions from PostgreSQL.
+      Automatically includes the 5 most recent symptom logs and 3 most recent cycle
+      records. Used at the start of returning-user sessions.
+    backend: "MemoryTool → PostgresMemoryService"
+    args:
+      user_id: "string (required)"
+      query_context: "string (optional)"
+
+  remember_detail:
+    enum: "Tool.MEMORY_SAVE"
+    mode: "standard"
+    description: >
+      Saves a qualitative detail about the user to JSONB storage in PostgreSQL
+      (chat_metadata.agent_remembered). For critical one-off facts only.
+    backend: "MemoryTool → PostgresMemoryService"
+    args:
+      session_id: "string (required)"
+      key: "string (required)"
+      value: "string (required)"
+
+  time_since_date:
+    enum: "Tool.TIME_ELAPSED"
+    mode: "standard and profiling"
+    description: >
+      Calculates elapsed time between two dates. Returns years, months, weeks,
+      days, total_days, total_months, and a plain-English human_summary.
+    backend: "TemporalTool.calculate_time_elapsed()"
+    args:
+      from_date: "YYYY-MM-DD (required)"
+      to_date: "YYYY-MM-DD (optional, defaults to today)"
+      label: "context string (optional)"
+
+  note_absent_tools: >
+    The following tools are declared in _TIER_TOOLS[A4] or in the Tool enum
+    but have NO @tool wrapper registered in ZienaAgent._initialize_tools() and
+    are therefore unavailable at runtime:
+      - save_profiling_answer  (Tool.PROFILING_SAVE not in _TIER_TOOLS[A4])
+      - stop_health_profiling  (Tool.PROFILING_STOP not in _TIER_TOOLS[A4])
+      - log_user_symptom       (Tool.SYMPTOM_LOG not in _TIER_TOOLS[A4])
+      - log_user_cycle         (Tool.CYCLE_LOG not in _TIER_TOOLS[A4])
+      - get_user_profile / get_symptom_data
+        (Tool.GET_USER_PROFILE etc. in _TIER_TOOLS[A4] but no @tool wrappers exist)
+      - update_user_profile / update_symptoms / update_menopause_stage
+        (Tool.UPDATE_* in _TIER_TOOLS[A4] but no @tool wrappers exist)
+
+# ---------------------------------------------------------------------------
+# Guardrails
+# ---------------------------------------------------------------------------
+guardrails:
+  enabled: true
+  implementation: "OrchestratorV2 → AdvancedContentGuard"
+  config_source: "DB-driven GuardrailRule model via get_active_guardrail_config()"
+  cache_ttl_seconds: 60
+  fail_open: "configurable per DB record"
+  input_guardrails:
+    description: >
+      User input is screened before reaching ZienaAgent. A flagged input returns
+      a pre-configured refusal/escalation message; the LLM is not called.
+  output_guardrails:
+    description: >
+      Agent response is screened after ZienaAgent returns. Includes URL validation.
+      A flagged response is replaced or suppressed.
+
+# ---------------------------------------------------------------------------
+# Memory
+# ---------------------------------------------------------------------------
+memory:
+  enabled: true
+  backend: "PostgresMemoryService (services/postgres_memory_service.py)"
+  storage: "PostgreSQL — chat_metadata.agent_remembered (JSONB)"
+  scope: "cross-session"
+  retrieve_tool: "retrieve_past_conversations"
+  save_tool: "remember_detail"
+
+# ---------------------------------------------------------------------------
+# RAG
+# ---------------------------------------------------------------------------
+rag:
+  enabled: true
+  service: "RAGService (services/rag_service.py)"
+  search_endpoint: "SEARCH_ENDPOINT env var"
+  index_name: "RAG_INDEX_NAME env var"
+  api_version: "2025-09-01"
+  k: 2
+  score_threshold: 0.7
+  vector_field: "text_vector"
+  selected_fields: ["chunk", "summary", "topic", "url"]
+  deduplication: "chunk-level within session"
+  citation_requirement: >
+    Every factual or clinical claim must be cited inline immediately after the
+    statement: [Source](URL). End-of-response citation lists are not acceptable.
+
+# ---------------------------------------------------------------------------
+# Profiling
+# ---------------------------------------------------------------------------
+profiling:
+  enabled: true
+  implementation: "MenopauseProfilingTool (agents_v2/tools/profiling_tool.py)"
+  trigger: >
+    OrchestratorV2 sets is_profiling_mode=True when the user's health profile
+    has missing required fields and the user has not previously opted out.
+  fields_collected:
+    - periods_stopped: "Whether the user's period has stopped"
+    - pattern: "Menstrual cycle pattern (regular / irregular)"
+    - symptoms: "Active symptoms"
+    - hormones: "Hormone therapy status"
+    - surgery: "Surgical menopause history"
+    - age: "Date of birth (used to calculate age via time_since_date)"
+    - tiebreaker: "Disambiguation question when stage is ambiguous"
+  stage_inference: >
+    MenopauseProfilingTool infers a menopause stage (pre / peri / post / surgical)
+    from collected answers. A4 is the only tier intended to write this stage and
+    updated profile fields back to the database — but the write-back tools
+    (save_profiling_answer, update_menopause_stage) are currently missing from
+    the runtime tool registry (see note_absent_tools above).
+  prompt_mode: "dual — standard and profiling"
+
+# ---------------------------------------------------------------------------
+# Evaluation routing (run_agent.py)
+# ---------------------------------------------------------------------------
+evaluation_routing:
+  dispatcher: "_ask_orchestrator"
+  agent_class: "ZienaAgent (default tier = A4_FULL)"
+  notes: >
+    A4 is the only tier for which _ask_orchestrator() produces the correct result,
+    since OrchestratorV2 defaults to creating an A4 agent. No routing fix needed
+    for A4 — only A2 and A3 are affected by the tier-routing bugs.
